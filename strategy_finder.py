@@ -203,19 +203,33 @@ def compute_qty_from_risk(equity, risk_usd, stop_distance, price, min_trade_usd,
     # Enforce minimum trade size
     min_qty = min_trade_usd / price
     if qty_from_risk < min_qty:
+        # Check if minimum qty would exceed notional cap
+        min_notional = min_qty * price
+        if min_notional > max_notional:
+            # Cannot satisfy both minimum trade size and notional cap
+            return 0.0, True, True
         qty_from_risk = min_qty
     
-    # Round to specified decimals
+    # Round qty to specified decimals
     qty = float(np.round(qty_from_risk, qty_decimals))
     
-    # Final validation
+    # Final validation - ensure we haven't violated constraints after rounding
     final_notional = qty * price
+    
+    # Check if final notional exceeds cap (after rounding)
+    if final_notional > max_notional * (1 + 1e-8):  # Small tolerance for rounding
+        # Scale down and re-round
+        qty = float(np.round(max_notional / price, qty_decimals))
+        final_notional = qty * price
+        is_capped = True
+    
+    # Check if final trade is too small
     is_too_small = final_notional < min_trade_usd
     
-    if qty <= 0 or math.isnan(qty) or math.isinf(qty):
+    if qty <= 0 or math.isnan(qty) or math.isinf(qty) or is_too_small:
         return 0.0, is_capped, True
     
-    return qty, is_capped, is_too_small
+    return qty, is_capped, False
 
 # ----------------- Backtest core -----------------
 def prepare_multi_tf(df_1m):
