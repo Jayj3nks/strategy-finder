@@ -4,14 +4,16 @@ strategy_finder.py
 
 Professional-grade AI-driven strategy tester for BTC/USDT spot CSV (1m).
 
-PHASE 1 ENHANCEMENTS:
-- Added notional cap (MAX_NOTIONAL_PCT) to prevent hidden leverage
-- Detailed trade ledger with entry/exit times, prices, fees, slippage
-- Minimum trades filter (MIN_TRADES) for robustness
-- Improved error handling and validation
+PHASE 2 ENHANCEMENTS:
+- Walk-forward out-of-sample (OOS) evaluation
+- Parameter perturbation stability tests
+- Deterministic runs with enhanced seed control
+- Parallel processing for performance
+- Structured artifacts in runs/ directory
 
 Usage:
     python strategy_finder.py --csv sample_BTCUSDT_1m.csv --budget 200 --seed 42
+    python strategy_finder.py --csv sample_BTCUSDT_1m.csv --oos --train_days 90 --test_days 14 --top_k_eval 5
 
 Dependencies (pip):
     pandas numpy matplotlib tqdm pytest
@@ -24,8 +26,10 @@ import os
 import random
 import time
 import uuid
+from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta
+from functools import partial
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -45,6 +49,13 @@ MAX_NOTIONAL_PCT = 1.0  # Maximum notional exposure as % of equity (prevents lev
 MIN_TRADES = 50         # Minimum trades required for valid strategy
 MIN_TRADE_SIZE_USD = 1.0
 QTY_DECIMALS = 8
+
+# PHASE 2: OOS and stability parameters
+DEFAULT_TRAIN_DAYS = 180    # Training window size
+DEFAULT_TEST_DAYS = 30      # Test window size
+DEFAULT_TOP_K_EVAL = 5      # Top K strategies to evaluate in OOS
+DEFAULT_STABILITY_PERTURBS = 10  # Number of perturbations for stability test
+DEFAULT_WORKERS = 1         # Default number of worker processes
 
 # Default parameter ranges
 DEFAULT_PARAM_RANGES = {
@@ -565,7 +576,222 @@ def simulate_trades(df_1m, indicators, params, starting_capital=10000.0):
         "trades": pnl_values,  # Keep for backward compatibility
     }
 
-# ----------------- Search Logic -----------------
+# ----------------- PHASE 2: Out-of-Sample & Stability Analysis -----------------
+
+def create_oos_windows(df_1m, train_days, test_days):
+    """
+    Create walk-forward analysis windows.
+    
+    Returns list of (train_start, train_end, test_start, test_end) tuples.
+    """
+    if len(df_1m) == 0:
+        return []
+    
+    # Convert days to timedelta
+    train_delta = timedelta(days=train_days)
+    test_delta = timedelta(days=test_days)
+    
+    start_time = df_1m.index[0]
+    end_time = df_1m.index[-1]
+    
+    windows = []
+    current_start = start_time
+    
+    while True:
+        train_end = current_start + train_delta
+        test_start = train_end
+        test_end = test_start + test_delta
+        
+        # Check if we have enough data for both training and testing
+        if test_end > end_time:
+            break
+        
+        # Ensure we have actual data in these ranges
+        train_data = df_1m[current_start:train_end]
+        test_data = df_1m[test_start:test_end]
+        
+        if len(train_data) >= 100 and len(test_data) >= 50:  # Minimum data requirements
+            windows.append((current_start, train_end, test_start, test_end))
+        
+        # Move to next window (with overlap)
+        current_start = current_start + test_delta
+    
+    return windows
+
+def run_oos_evaluation(df_1m, param_ranges, train_days=180, test_days=30, 
+                      top_k_eval=5, budget_per_window=50, seed=42, 
+                      min_trades=MIN_TRADES):
+    """
+    PHASE 2: Run walk-forward out-of-sample evaluation.
+    
+    Returns:
+        dict: OOS evaluation results with aggregated metrics
+    """
+    print(f"\nPHASE 2: Out-of-Sample Evaluation")
+    print(f"Train days: {train_days}, Test days: {test_days}, Top-K: {top_k_eval}")
+    
+    # Create windows
+    windows = create_oos_windows(df_1m, train_days, test_days)
+    
+    if len(windows) == 0:
+        raise ValueError("No valid OOS windows found. Data too short or parameters too large.")
+    
+    print(f"Created {len(windows)} OOS windows")
+    
+    rng = np.random.default_rng(seed)
+    oos_results = []
+    
+    for window_idx, (train_start, train_end, test_start, test_end) in enumerate(windows):
+        print(f"\nWindow {window_idx + 1}/{len(windows)}: "
+              f"Train {train_start.date()} to {train_end.date()}, "
+              f"Test {test_start.date()} to {test_end.date()}")
+        
+        # Split data
+        train_data = df_1m[train_start:train_end]
+        test_data = df_1m[test_start:test_end]
+        
+        print(f"  Train: {len(train_data)} bars, Test: {len(test_data)} bars")
+        
+        # Run optimization on training data
+        print(f"  Optimizing on training data...")
+        train_results = run_search(
+            train_data, 
+            budget=budget_per_window,
+            seed=seed + window_idx,
+            param_ranges=param_ranges,
+            min_trades=min_trades // 2,  # Relax for shorter windows
+            verbose=False
+        )
+        
+        # Get top K valid strategies
+        valid_strategies = [r for r in train_results if r.get("valid", True)]
+        if len(valid_strategies) == 0:
+            print(f"  ⚠️  No valid strategies found in training window {window_idx + 1}")
+            continue
+        
+        top_strategies = valid_strategies[:min(top_k_eval, len(valid_strategies))]
+        print(f"  Testing top {len(top_strategies)} strategies on OOS data...")
+        
+        # Evaluate on test data
+        window_oos_metrics = []
+        for strategy in top_strategies:
+            try:
+                test_result = run_one_test(test_data, strategy["params"])
+                
+                oos_metrics = {
+                    "train_uid": strategy["uid"],
+                    "train_score": strategy.get("score", 0),
+                    "oos_net_pnl": test_result["net_pnl"],
+                    "oos_winrate": test_result["winrate"],
+                    "oos_num_trades": test_result["num_trades"],
+                    "oos_max_drawdown": test_result["max_drawdown"],
+                    "oos_valid": test_result.get("valid", True),
+                    "params": strategy["params"]
+                }
+                window_oos_metrics.append(oos_metrics)
+                
+            except Exception as e:
+                print(f"    Error evaluating strategy {strategy['uid']}: {e}")
+        
+        if window_oos_metrics:
+            oos_results.append({
+                "window": window_idx + 1,
+                "train_period": f"{train_start.date()} to {train_end.date()}",
+                "test_period": f"{test_start.date()} to {test_end.date()}",
+                "strategies": window_oos_metrics
+            })
+            
+            # Show best OOS result for this window
+            best_oos = max(window_oos_metrics, key=lambda x: x["oos_net_pnl"])
+            print(f"  ✅ Best OOS P&L: ${best_oos['oos_net_pnl']:.2f} "
+                  f"(winrate: {best_oos['oos_winrate']*100:.1f}%, "
+                  f"trades: {best_oos['oos_num_trades']})")
+    
+    if not oos_results:
+        raise ValueError("No valid OOS results generated")
+    
+    # Aggregate results across windows
+    all_oos_metrics = []
+    for window_result in oos_results:
+        all_oos_metrics.extend(window_result["strategies"])
+    
+    # Calculate aggregated statistics
+    oos_pnls = [m["oos_net_pnl"] for m in all_oos_metrics if m["oos_valid"]]
+    oos_winrates = [m["oos_winrate"] for m in all_oos_metrics if m["oos_valid"]]
+    oos_drawdowns = [m["oos_max_drawdown"] for m in all_oos_metrics if m["oos_valid"]]
+    
+    aggregated_metrics = {
+        "mean_oos_pnl": np.mean(oos_pnls) if oos_pnls else 0,
+        "std_oos_pnl": np.std(oos_pnls) if oos_pnls else 0,
+        "mean_oos_winrate": np.mean(oos_winrates) if oos_winrates else 0,
+        "mean_oos_drawdown": np.mean(oos_drawdowns) if oos_drawdowns else 0,
+        "num_windows": len(oos_results),
+        "num_strategies_tested": len(all_oos_metrics),
+        "num_valid_strategies": len([m for m in all_oos_metrics if m["oos_valid"]])
+    }
+    
+    return {
+        "windows": oos_results,
+        "aggregated": aggregated_metrics,
+        "all_strategies": all_oos_metrics
+    }
+
+def run_stability_test(df_1m, base_params, param_ranges, n_perturbs=10, seed=42):
+    """
+    PHASE 2: Test parameter stability with small perturbations.
+    
+    Returns stability metrics for the given parameter set.
+    """
+    rng = np.random.default_rng(seed)
+    
+    # Run base case
+    base_result = run_one_test(df_1m, base_params)
+    
+    # Generate perturbations
+    perturbed_results = []
+    for i in range(n_perturbs):
+        # Small perturbations (5% of parameter range)
+        perturbed_params = perturb_params(base_params, param_ranges, rng, scale=0.05)
+        
+        try:
+            result = run_one_test(df_1m, perturbed_params)
+            perturbed_results.append(result)
+        except Exception:
+            # Skip failed perturbations
+            continue
+    
+    if not perturbed_results:
+        return {
+            "base_pnl": base_result["net_pnl"],
+            "stability_score": 0.0,
+            "pnl_variance": float('inf'),
+            "num_successful_perturbs": 0
+        }
+    
+    # Calculate stability metrics
+    base_pnl = base_result["net_pnl"]
+    perturbed_pnls = [r["net_pnl"] for r in perturbed_results]
+    
+    pnl_variance = np.var(perturbed_pnls)
+    pnl_std = np.std(perturbed_pnls)
+    
+    # Stability score: penalize high variance
+    # Higher is better (lower variance)
+    if pnl_std > 0:
+        stability_score = max(0, 1000 - pnl_std)  # Normalize to reasonable range
+    else:
+        stability_score = 1000  # Perfect stability
+    
+    return {
+        "base_pnl": base_pnl,
+        "perturbed_pnls": perturbed_pnls,
+        "pnl_variance": pnl_variance,
+        "pnl_std": pnl_std,
+        "stability_score": stability_score,
+        "num_successful_perturbs": len(perturbed_results)
+    }
+
+# ----------------- Search Logic (Enhanced) -----------------
 def sample_random_params(ranges, rng):
     """Sample random parameters from ranges."""
     p = {}
@@ -667,8 +893,17 @@ def run_one_test(df_1m, params):
             "error": str(e)
         }
 
-def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRADES):
-    """Run parameter search with PHASE 1 enhancements."""
+# PHASE 2: Parallel-enabled test runner
+def run_one_test_parallel(args):
+    """Wrapper for parallel execution."""
+    df_1m, params = args
+    return run_one_test(df_1m, params)
+
+def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRADES, 
+               workers=1, verbose=True):
+    """
+    PHASE 2: Enhanced search with optional parallelization.
+    """
     rng = np.random.default_rng(seed)
     param_ranges = param_ranges or DEFAULT_PARAM_RANGES
     results = []
@@ -679,15 +914,36 @@ def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRA
     n_top = max(5, int(0.05 * budget))
     n_perturb = max(5, int(0.2 * budget / max(1, n_top)))
     
-    print(f"PHASE 1 Search: budget={budget}, min_trades={min_trades}, random_init={n_random}")
+    if verbose:
+        print(f"Enhanced Search: budget={budget}, min_trades={min_trades}, workers={workers}")
     
     # Random sampling phase
-    for _ in tqdm(range(n_random), desc="Random init"):
-        p = sample_random_params(param_ranges, rng)
-        res = run_one_test(df_1m, p)
-        res_row = {"uid": uid, "params": p, **res}
-        results.append(res_row)
-        uid += 1
+    param_sets = [sample_random_params(param_ranges, rng) for _ in range(n_random)]
+    
+    if workers > 1:
+        # Parallel execution
+        if verbose:
+            print(f"Running {n_random} tests in parallel with {workers} workers...")
+        
+        with ProcessPoolExecutor(max_workers=workers) as executor:
+            args_list = [(df_1m, params) for params in param_sets]
+            parallel_results = list(tqdm(
+                executor.map(run_one_test_parallel, args_list),
+                total=len(args_list),
+                desc="Random init (parallel)"
+            ))
+        
+        for i, (params, result) in enumerate(zip(param_sets, parallel_results)):
+            res_row = {"uid": uid, "params": params, **result}
+            results.append(res_row)
+            uid += 1
+    else:
+        # Sequential execution
+        for params in tqdm(param_sets, desc="Random init"):
+            res = run_one_test(df_1m, params)
+            res_row = {"uid": uid, "params": params, **res}
+            results.append(res_row)
+            uid += 1
 
     def build_norm(results_list):
         # Only use valid results for normalization
@@ -744,12 +1000,26 @@ def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRA
         if not to_test:
             break
         
-        # Evaluate perturbations
-        for p in tqdm(to_test, desc=f"Iter {iteration} perturb"):
-            res = run_one_test(df_1m, p)
-            res_row = {"uid": uid, "params": p, **res}
-            results.append(res_row)
-            uid += 1
+        # Evaluate perturbations (can be parallel)
+        if workers > 1 and len(to_test) > 5:
+            with ProcessPoolExecutor(max_workers=workers) as executor:
+                args_list = [(df_1m, params) for params in to_test]
+                parallel_results = list(tqdm(
+                    executor.map(run_one_test_parallel, args_list),
+                    total=len(args_list),
+                    desc=f"Iter {iteration} perturb (parallel)"
+                ))
+            
+            for params, result in zip(to_test, parallel_results):
+                res_row = {"uid": uid, "params": params, **result}
+                results.append(res_row)
+                uid += 1
+        else:
+            for p in tqdm(to_test, desc=f"Iter {iteration} perturb"):
+                res = run_one_test(df_1m, p)
+                res_row = {"uid": uid, "params": p, **res}
+                results.append(res_row)
+                uid += 1
         
         # Update normalization
         stats_norm = build_norm(results)
@@ -757,13 +1027,26 @@ def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRA
         # Random restarts
         if rng.random() < 0.1 and remaining_budget > 0:
             n_rr = min(5, remaining_budget)
-            for _ in range(n_rr):
-                p = sample_random_params(param_ranges, rng)
-                res = run_one_test(df_1m, p)
-                res_row = {"uid": uid, "params": p, **res}
-                results.append(res_row)
-                uid += 1
-                remaining_budget -= 1
+            restart_params = [sample_random_params(param_ranges, rng) for _ in range(n_rr)]
+            
+            if workers > 1 and len(restart_params) > 2:
+                with ProcessPoolExecutor(max_workers=workers) as executor:
+                    args_list = [(df_1m, params) for params in restart_params]
+                    parallel_results = list(executor.map(run_one_test_parallel, args_list))
+                
+                for params, result in zip(restart_params, parallel_results):
+                    res_row = {"uid": uid, "params": params, **result}
+                    results.append(res_row)
+                    uid += 1
+                    remaining_budget -= 1
+            else:
+                for p in restart_params:
+                    res = run_one_test(df_1m, p)
+                    res_row = {"uid": uid, "params": p, **res}
+                    results.append(res_row)
+                    uid += 1
+                    remaining_budget -= 1
+            
             stats_norm = build_norm(results)
 
     # Final scoring
@@ -774,14 +1057,97 @@ def run_search(df_1m, budget=200, seed=42, param_ranges=None, min_trades=MIN_TRA
     results_sorted = sorted(results, key=lambda x: x["score"], reverse=True)
     
     # Report on invalid strategies
-    invalid_count = sum(1 for r in results if not r.get("valid", True))
-    valid_count = len(results) - invalid_count
-    
-    print(f"\nSearch complete: {valid_count} valid strategies, {invalid_count} invalid (< {min_trades} trades)")
+    if verbose:
+        invalid_count = sum(1 for r in results if not r.get("valid", True))
+        valid_count = len(results) - invalid_count
+        print(f"Search complete: {valid_count} valid strategies, {invalid_count} invalid (< {min_trades} trades)")
     
     return results_sorted
 
-# ----------------- Output Functions -----------------
+# ----------------- PHASE 2: Artifact Management -----------------
+
+def save_run_artifacts(results, run_uid, seed, params_used, save_runs_dir="runs"):
+    """
+    PHASE 2: Save detailed artifacts for each run.
+    """
+    os.makedirs(save_runs_dir, exist_ok=True)
+    
+    # Save run metadata
+    metadata = {
+        "run_uid": run_uid,
+        "timestamp": datetime.now().isoformat(),
+        "seed": seed,
+        "num_strategies_tested": len(results),
+        "num_valid_strategies": sum(1 for r in results if r.get("valid", True)),
+        "parameters_ranges": params_used,
+        "best_score": results[0].get("score", 0) if results else 0,
+        "best_uid": results[0].get("uid") if results else None
+    }
+    
+    metadata_file = os.path.join(save_runs_dir, f"{run_uid}_meta.json")
+    with open(metadata_file, 'w') as f:
+        json.dump(metadata, f, indent=2)
+    
+    # Save detailed results
+    results_file = os.path.join(save_runs_dir, f"{run_uid}_results.json")
+    
+    # Prepare results for JSON serialization
+    json_results = []
+    for r in results:
+        json_r = r.copy()
+        # Convert numpy arrays to lists
+        if 'equity_curve' in json_r:
+            json_r['equity_curve'] = json_r['equity_curve'].tolist()
+        if 'trades' in json_r:
+            json_r['trades'] = json_r['trades'].tolist()
+        # Convert timestamps in trade ledger
+        if 'trade_ledger' in json_r:
+            for trade in json_r['trade_ledger']:
+                if 'entry_time' in trade:
+                    trade['entry_time'] = str(trade['entry_time'])
+                if 'exit_time' in trade:
+                    trade['exit_time'] = str(trade['exit_time'])
+        
+        json_results.append(json_r)
+    
+    with open(results_file, 'w') as f:
+        json.dump(json_results, f, indent=2)
+    
+    # Save best strategy trades if available
+    if results and results[0].get("trade_ledger"):
+        best_trades_file = os.path.join(save_runs_dir, f"{run_uid}_best_trades.json")
+        with open(best_trades_file, 'w') as f:
+            best_ledger = results[0]["trade_ledger"].copy()
+            # Convert timestamps to strings
+            for trade in best_ledger:
+                trade['entry_time'] = str(trade['entry_time'])
+                trade['exit_time'] = str(trade['exit_time'])
+            json.dump(best_ledger, f, indent=2)
+    
+    return {
+        "metadata_file": metadata_file,
+        "results_file": results_file,
+        "run_uid": run_uid
+    }
+
+def save_oos_summary(oos_results, save_runs_dir="runs"):
+    """
+    PHASE 2: Save OOS evaluation summary.
+    """
+    os.makedirs(save_runs_dir, exist_ok=True)
+    
+    oos_file = os.path.join(save_runs_dir, "oos_summary.json")
+    
+    # Prepare for JSON serialization
+    json_oos = deepcopy(oos_results)
+    
+    with open(oos_file, 'w') as f:
+        json.dump(json_oos, f, indent=2)
+    
+    print(f"Saved OOS summary to {oos_file}")
+    return oos_file
+
+# ----------------- Output Functions (Enhanced) -----------------
 def save_results(results_sorted, out_csv=RESULTS_CSV):
     """Save search results to CSV."""
     rows = []
@@ -837,9 +1203,9 @@ def save_best_artifacts(best, output_prefix="best"):
 
 def summarize_best(best, min_trades=MIN_TRADES):
     """Print summary of best strategy."""
-    print("\n" + "="*50)
-    print("PHASE 1 ENHANCED STRATEGY SUMMARY")
-    print("="*50)
+    print("\n" + "="*60)
+    print("PHASE 2 ENHANCED STRATEGY SUMMARY")
+    print("="*60)
     print(f"UID: {best['uid']}")
     print(f"Score: {best.get('score', 0.0):.4f}")
     print(f"Valid: {best.get('valid', True)} (min trades: {min_trades})")
@@ -853,21 +1219,66 @@ def summarize_best(best, min_trades=MIN_TRADES):
     print("\nParameters:")
     print(json.dumps(best["params"], indent=2))
 
-# ----------------- CLI & Main -----------------
+def summarize_oos_results(oos_results):
+    """
+    PHASE 2: Print OOS evaluation summary.
+    """
+    print("\n" + "="*60)
+    print("OUT-OF-SAMPLE EVALUATION SUMMARY")
+    print("="*60)
+    
+    agg = oos_results["aggregated"]
+    
+    print(f"Number of Windows: {agg['num_windows']}")
+    print(f"Strategies Tested: {agg['num_strategies_tested']}")
+    print(f"Valid Strategies: {agg['num_valid_strategies']}")
+    print(f"\nAggregated OOS Metrics:")
+    print(f"  Mean P&L: ${agg['mean_oos_pnl']:.2f} ± ${agg['std_oos_pnl']:.2f}")
+    print(f"  Mean Win Rate: {agg['mean_oos_winrate']*100:.2f}%")
+    print(f"  Mean Drawdown: {agg['mean_oos_drawdown']*100:.2f}%")
+    
+    # Show best strategy across all windows
+    if oos_results["all_strategies"]:
+        valid_strategies = [s for s in oos_results["all_strategies"] if s["oos_valid"]]
+        if valid_strategies:
+            best_oos = max(valid_strategies, key=lambda x: x["oos_net_pnl"])
+            print(f"\nBest OOS Strategy:")
+            print(f"  P&L: ${best_oos['oos_net_pnl']:.2f}")
+            print(f"  Win Rate: {best_oos['oos_winrate']*100:.2f}%")
+            print(f"  Trades: {best_oos['oos_num_trades']}")
+            print(f"  Max Drawdown: {best_oos['oos_max_drawdown']*100:.2f}%")
+
+# ----------------- CLI & Main (Enhanced) -----------------
 def parse_args():
-    """Parse command line arguments."""
-    p = argparse.ArgumentParser(description="Professional Strategy Finder for BTC CSV (1m)")
+    """Parse command line arguments with PHASE 2 enhancements."""
+    p = argparse.ArgumentParser(description="Professional Strategy Finder for BTC CSV (1m) - Phase 2")
+    
+    # Basic parameters
     p.add_argument("--csv", type=str, default=DEFAULT_CSV, help="Path to BTC 1m CSV")
     p.add_argument("--budget", type=int, default=DEFAULT_BUDGET, help="Number of backtests to run")
-    p.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed")
+    p.add_argument("--seed", type=int, default=DEFAULT_SEED, help="Random seed for reproducibility")
     p.add_argument("--out", type=str, default=RESULTS_CSV, help="Results CSV output")
     p.add_argument("--quick", action="store_true", help="Quick mode (reduce budget and ranges)")
+    
+    # Phase 1 parameters
     p.add_argument("--min_trades", type=int, default=MIN_TRADES, help="Minimum trades for valid strategy")
     p.add_argument("--max_notional_pct", type=float, default=MAX_NOTIONAL_PCT, help="Maximum notional exposure as % of equity")
+    
+    # Phase 2 parameters
+    p.add_argument("--oos", action="store_true", help="Run out-of-sample evaluation")
+    p.add_argument("--train_days", type=int, default=DEFAULT_TRAIN_DAYS, help="Training window size in days")
+    p.add_argument("--test_days", type=int, default=DEFAULT_TEST_DAYS, help="Test window size in days")
+    p.add_argument("--top_k_eval", type=int, default=DEFAULT_TOP_K_EVAL, help="Top K strategies to evaluate in OOS")
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="Number of parallel workers")
+    p.add_argument("--stability_perturbs", type=int, default=DEFAULT_STABILITY_PERTURBS, help="Number of perturbations for stability test")
+    p.add_argument("--save_runs_dir", type=str, default="runs", help="Directory to save run artifacts")
+    
     return p.parse_args()
 
 def main():
-    """Main function."""
+    """
+    PHASE 2: Enhanced main function with OOS evaluation and parallel processing.
+    """
     args = parse_args()
     
     # Update global constants from args
@@ -875,9 +1286,10 @@ def main():
     MIN_TRADES = args.min_trades
     MAX_NOTIONAL_PCT = args.max_notional_pct
     
-    print(f"PHASE 1 Enhanced Strategy Finder")
-    print(f"Min trades requirement: {MIN_TRADES}")
-    print(f"Max notional exposure: {MAX_NOTIONAL_PCT*100:.1f}%")
+    print(f"PHASE 2 Professional Strategy Finder")
+    print(f"Seed: {args.seed} | Min trades: {MIN_TRADES} | Max notional: {MAX_NOTIONAL_PCT*100:.1f}%")
+    if args.workers > 1:
+        print(f"Parallel processing: {args.workers} workers")
     
     # Load and validate data
     if not os.path.exists(args.csv):
@@ -885,7 +1297,7 @@ def main():
     
     print(f"Loading CSV: {args.csv}")
     df_1m = load_csv(args.csv)
-    print(f"Loaded {len(df_1m)} rows from CSV (data range: {df_1m.index[0]} to {df_1m.index[-1]})")
+    print(f"Loaded {len(df_1m)} rows (data range: {df_1m.index[0]} to {df_1m.index[-1]})")
     
     # Parameter ranges
     param_ranges = deepcopy(DEFAULT_PARAM_RANGES)
@@ -904,40 +1316,132 @@ def main():
             "RISK_PCT": (0.5, 1.0),
         }
         args.budget = min(args.budget, 50)
+        args.workers = 1  # Force sequential for quick mode
         print(f"Quick mode: reduced budget to {args.budget}")
-
-    # Run search
-    start_time = time.time()
-    results_sorted = run_search(df_1m, budget=args.budget, seed=args.seed, 
-                               param_ranges=param_ranges, min_trades=args.min_trades)
-    elapsed = time.time() - start_time
     
-    print(f"\nSearch completed in {elapsed:.1f}s. Total tested: {len(results_sorted)}")
+    # Generate unique run ID for artifacts
+    run_uid = f"{int(time.time())}_{args.seed}"
     
-    # Save results
-    save_results(results_sorted, out_csv=args.out)
+    # PHASE 2: Choose execution path
+    if args.oos:
+        # Out-of-sample evaluation
+        print("\n" + "="*60)
+        print("RUNNING OUT-OF-SAMPLE EVALUATION")
+        print("="*60)
+        
+        try:
+            oos_results = run_oos_evaluation(
+                df_1m,
+                param_ranges=param_ranges,
+                train_days=args.train_days,
+                test_days=args.test_days,
+                top_k_eval=args.top_k_eval,
+                budget_per_window=args.budget,
+                seed=args.seed,
+                min_trades=args.min_trades
+            )
+            
+            # Save OOS results
+            save_oos_summary(oos_results, args.save_runs_dir)
+            summarize_oos_results(oos_results)
+            
+            # Find best strategy across all OOS windows
+            valid_oos_strategies = [s for s in oos_results["all_strategies"] if s["oos_valid"]]
+            
+            if valid_oos_strategies:
+                best_oos_strategy = max(valid_oos_strategies, key=lambda x: x["oos_net_pnl"])
+                
+                print(f"\n🏆 Best OOS Strategy Found!")
+                print(f"P&L: ${best_oos_strategy['oos_net_pnl']:.2f}")
+                print(f"Win Rate: {best_oos_strategy['oos_winrate']*100:.2f}%")
+                print(f"Parameters: {json.dumps(best_oos_strategy['params'], indent=2)}")
+                
+                # Run stability test on best OOS strategy
+                if args.stability_perturbs > 0:
+                    print(f"\nRunning stability test with {args.stability_perturbs} perturbations...")
+                    stability = run_stability_test(
+                        df_1m, 
+                        best_oos_strategy['params'], 
+                        param_ranges, 
+                        n_perturbs=args.stability_perturbs,
+                        seed=args.seed
+                    )
+                    
+                    print(f"Stability Results:")
+                    print(f"  Base P&L: ${stability['base_pnl']:.2f}")
+                    print(f"  P&L Std Dev: ${stability['pnl_std']:.2f}")
+                    print(f"  Stability Score: {stability['stability_score']:.2f}")
+                    print(f"  Successful Perturbations: {stability['num_successful_perturbs']}/{args.stability_perturbs}")
+            else:
+                print("\n⚠️  No valid OOS strategies found!")
+        
+        except Exception as e:
+            print(f"\n❌ OOS evaluation failed: {e}")
+            return
     
-    # Find valid strategies
-    valid_strategies = [r for r in results_sorted if r.get("valid", True)]
-    
-    if not valid_strategies:
-        print("\nWARNING: No valid strategies found! Consider:")
-        print("- Reducing --min_trades parameter")
-        print("- Increasing --budget for more search iterations")
-        print("- Checking data quality and timeframe")
-        return
-    
-    # Top strategies summary
-    print(f"\nTop {min(5, len(valid_strategies))} valid strategies:")
-    for i, r in enumerate(valid_strategies[:5], 1):
-        print(f"{i}. UID {r['uid']}: equity ${r['final_equity']:.2f}, "
-              f"winrate {r['winrate']*100:.2f}%, trades {r['num_trades']}, "
-              f"score {r.get('score', 0):.4f}")
-    
-    # Save best artifacts
-    best = valid_strategies[0]
-    save_best_artifacts(best)
-    summarize_best(best, min_trades=args.min_trades)
+    else:
+        # Standard in-sample optimization
+        print("\n" + "="*60)
+        print("RUNNING IN-SAMPLE OPTIMIZATION")  
+        print("="*60)
+        
+        start_time = time.time()
+        results_sorted = run_search(
+            df_1m, 
+            budget=args.budget, 
+            seed=args.seed,
+            param_ranges=param_ranges, 
+            min_trades=args.min_trades,
+            workers=args.workers,
+            verbose=True
+        )
+        elapsed = time.time() - start_time
+        
+        print(f"\nSearch completed in {elapsed:.1f}s. Total tested: {len(results_sorted)}")
+        
+        # Save results and artifacts
+        save_results(results_sorted, out_csv=args.out)
+        artifact_info = save_run_artifacts(results_sorted, run_uid, args.seed, param_ranges, args.save_runs_dir)
+        print(f"Saved run artifacts: {artifact_info['run_uid']}")
+        
+        # Find valid strategies
+        valid_strategies = [r for r in results_sorted if r.get("valid", True)]
+        
+        if not valid_strategies:
+            print("\nWARNING: No valid strategies found! Consider:")
+            print("- Reducing --min_trades parameter")
+            print("- Increasing --budget for more search iterations") 
+            print("- Using --oos for more robust evaluation")
+            return
+        
+        # Top strategies summary
+        print(f"\nTop {min(5, len(valid_strategies))} valid strategies:")
+        for i, r in enumerate(valid_strategies[:5], 1):
+            print(f"{i}. UID {r['uid']}: equity ${r['final_equity']:.2f}, "
+                  f"winrate {r['winrate']*100:.2f}%, trades {r['num_trades']}, "
+                  f"score {r.get('score', 0):.4f}")
+        
+        # Save best artifacts
+        best = valid_strategies[0]
+        save_best_artifacts(best)
+        summarize_best(best, min_trades=args.min_trades)
+        
+        # PHASE 2: Run stability test on best strategy
+        if args.stability_perturbs > 0:
+            print(f"\nRunning stability test on best strategy...")
+            stability = run_stability_test(
+                df_1m, 
+                best['params'], 
+                param_ranges, 
+                n_perturbs=args.stability_perturbs,
+                seed=args.seed
+            )
+            
+            print(f"\nStability Analysis:")
+            print(f"  Base P&L: ${stability['base_pnl']:.2f}")
+            print(f"  P&L Std Dev: ${stability['pnl_std']:.2f}")
+            print(f"  Stability Score: {stability['stability_score']:.2f}")
+            print(f"  Successful Perturbations: {stability['num_successful_perturbs']}/{args.stability_perturbs}")
 
 if __name__ == "__main__":
     main()
